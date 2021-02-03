@@ -2,6 +2,7 @@
 use crate::{Game, IntoRunCondition, RunCondition};
 
 use tapir::Tap;
+use rayon::prelude::*;
 
 use std::cmp::{self, Reverse};
 use std::mem;
@@ -55,7 +56,9 @@ pub struct Bot<T: Game> {
     player: T::Player,
 }
 
-impl<T: Game> Bot<T> {
+impl<T: Game + Sync> Bot<T>
+    where <<T as Game>::Actions as IntoIterator>::IntoIter: Send
+{
     /// Creates a new `Bot` for the given `player`.
     pub fn new(player: T::Player) -> Self {
         Self { player }
@@ -67,7 +70,9 @@ impl<T: Game> Bot<T> {
     ///
     /// This method runs until either the best possible action was found
     /// or one of `RunCondition::depth` and `RunCondition::step` returned `false`.
-    pub fn select<U: IntoRunCondition>(&mut self, state: &T, condition: U) -> Option<T::Action> {
+    pub fn select<U: IntoRunCondition + Clone>(&mut self, state: &T, condition: U) -> Option<T::Action>
+        where <U as IntoRunCondition>::RunCondition: Send,
+    {
         self.inner_select(state, condition)
             .map(|mut act| act.path.pop().unwrap())
     }
@@ -95,18 +100,20 @@ impl<T: Game> Bot<T> {
     ///     .unwrap()
     ///     .path, &[1, 0]);
     /// ```
-    pub fn detailed_select<U: IntoRunCondition>(
+    pub fn detailed_select<U: IntoRunCondition + Clone>(
         &mut self,
         state: &T,
         condition: U,
-    ) -> Option<Action<T>> {
+    ) -> Option<Action<T>>
+        where <U as IntoRunCondition>::RunCondition: Send,
+    {
         self.inner_select(state, condition)
             .map(|act| act.tap(|act| act.path.reverse()))
     }
 
-    fn inner_select<U: IntoRunCondition>(&mut self, state: &T, condition: U) -> Option<Action<T>> {
-        let mut condition = condition.into_run_condition();
-
+    fn inner_select<U: IntoRunCondition + Clone>(&mut self, state: &T, condition: U) -> Option<Action<T>>
+        where <U as IntoRunCondition>::RunCondition: Send,
+    {
         let (active, actions) = state.actions(self.player);
         if !active {
             return None;
@@ -114,78 +121,86 @@ impl<T: Game> Bot<T> {
 
         let actions: Vec<_> = actions
             .into_iter()
-            .map(|action| Action {
+            .map(|action| (Action {
                 fitness: state.look_ahead(&action, self.player),
                 path: vec![action],
-            })
+            }, condition.clone().into_run_condition()))
             .collect();
 
         if actions.is_empty() {
             return None;
         }
 
-        let mut ctxt = Ctxt::new(state, self.player, actions);
+        let mut final_actions = actions.into_par_iter().filter_map(|(a, mut condition)| {
+            let actions = vec![a];
+            let mut ctxt = Ctxt::new(state, self.player, actions);
 
-        for depth in 0.. {
-            if !condition.depth(depth) {
-                return Some(ctxt.cancel());
-            }
-
-            // Return early in case there is only one relevant action left.
-            // This is the case if we either only have one possible actions,
-            // or if all other possible actions are worse than the lower bound.
-            if let Some(exhausted) = ctxt.exhausted() {
-                return Some(exhausted);
-            }
-
-            let mut unfinished = mem::take(&mut ctxt.unfinished);
-            // Try unfinished actions with a high expected fitness first,
-            // as they are expected to give us a better alpha value.
-            unfinished.sort_by_key(|act| Reverse(act.fitness));
-
-            if let Some(best) = ctxt.best.take() {
-                // If computation is cancelled here, we don't know anything new,
-                // so we can just return the previous best action.
-                if let Some(ret) = ctxt.try_action(best, depth, &mut condition, |_, act| act) {
-                    return Some(ret);
+            for depth in 0.. {
+                if !condition.depth(depth) {
+                    return Some(ctxt.cancel());
                 }
-            }
 
-            for action in unfinished.into_iter() {
-                // In case computation is cancelled here, we may not yet have computed the best action of
-                // the previous depth, to guard against this, we add the cancelled action back to `state.unfinished`
-                // in case it is still empty.
-                let on_cancel = |ctxt: &mut Ctxt<T>, act| {
-                    if ctxt.unfinished.is_empty() {
-                        ctxt.unfinished.push(act);
+                // Return early in case there is only one relevant action left.
+                // This is the case if we either only have one possible actions,
+                // or if all other possible actions are worse than the lower bound.
+                if let Some(exhausted) = ctxt.exhausted() {
+                    return Some(exhausted);
+                }
+
+                let mut unfinished = mem::take(&mut ctxt.unfinished);
+                // Try unfinished actions with a high expected fitness first,
+                // as they are expected to give us a better alpha value.
+                unfinished.sort_by_key(|act| Reverse(act.fitness));
+
+                if let Some(best) = ctxt.best.take() {
+                    // If computation is cancelled here, we don't know anything new,
+                    // so we can just return the previous best action.
+                    if let Some(ret) = ctxt.try_action(best, depth, &mut condition, |_, act| act) {
+                        return Some(ret);
                     }
-                    ctxt.cancel()
-                };
+                }
 
-                if let Some(ret) = ctxt.try_action(action, depth, &mut condition, on_cancel) {
-                    return Some(ret);
+                for action in unfinished.into_iter() {
+                    // In case computation is cancelled here, we may not yet have computed the best action of
+                    // the previous depth, to guard against this, we add the cancelled action back to `state.unfinished`
+                    // in case it is still empty.
+                    let on_cancel = |ctxt: &mut Ctxt<T>, act| {
+                        if ctxt.unfinished.is_empty() {
+                            ctxt.unfinished.push(act);
+                        }
+                        ctxt.cancel()
+                    };
+
+                    if let Some(ret) = ctxt.try_action(action, depth, &mut condition, on_cancel) {
+                        return Some(ret);
+                    }
+                }
+
+                // We only test partially terminated action which may still be better than the best
+                // fitness at the current depth.
+                //
+                // As the current best fitness does not come from a terminated path,
+                // we still have to keep the other partially terminated actions around,
+                // in case the best fitness of a later depth is lower.
+                for action in ctxt.relevant_partials() {
+                    // In case computation is cancelled here, we already tested at least some actions which were better than
+                    // the cancelled partial action at the previous depth, so we can use `ctxt.cancel()` without any special
+                    // considerations.
+                    if let Some(ret) =
+                        ctxt.try_action(action, depth, &mut condition, |ctxt, _| ctxt.cancel())
+                    {
+                        return Some(ret);
+                    }
                 }
             }
 
-            // We only test partially terminated action which may still be better than the best
-            // fitness at the current depth.
-            //
-            // As the current best fitness does not come from a terminated path,
-            // we still have to keep the other partially terminated actions around,
-            // in case the best fitness of a later depth is lower.
-            for action in ctxt.relevant_partials() {
-                // In case computation is cancelled here, we already tested at least some actions which were better than
-                // the cancelled partial action at the previous depth, so we can use `ctxt.cancel()` without any special
-                // considerations.
-                if let Some(ret) =
-                    ctxt.try_action(action, depth, &mut condition, |ctxt, _| ctxt.cancel())
-                {
-                    return Some(ret);
-                }
-            }
-        }
+            unreachable!();
+        }).collect::<Vec<_>>();
 
-        unreachable!();
+
+        final_actions.sort_by_key(|a| Reverse((a.fitness, a.path.len())));
+
+        final_actions.into_iter().next()
     }
 }
 

@@ -191,11 +191,11 @@ use std::time::{Duration, Instant};
 /// [examples]: https://github.com/lcnr/rubot/tree/master/examples
 pub trait Game: Clone {
     /// The player type.
-    type Player: Copy;
+    type Player: Copy + Sync;
     /// An executable action.
-    type Action: PartialEq + Clone;
+    type Action: PartialEq + Clone + Send;
     /// The fitness of a state.
-    type Fitness: Ord + Copy;
+    type Fitness: Ord + Copy + Send;
     /// The collection returned by [`actions`][ac].
     ///
     /// [ac]:trait.Game.html#tymethod.actions
